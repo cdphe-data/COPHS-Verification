@@ -1,0 +1,346 @@
+---
+title: "COPHS Verification Report"
+author: "Brian Erly - CDPHE"
+date: "`r lubridate::today()`"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#Basic data manipulation functions and grammar
+library(tidyverse)
+
+#Make graphs look nicer
+library(ggthemes)
+
+#Manipulate dates easier
+library(lubridate)
+
+#Make nice output text
+library(glue)
+
+#Access REDcap
+library(redcapAPI)
+
+#Make nice tables
+library(kableExtra)
+
+#Brian-Defined Functions
+
+#Check if something is not found in a list
+"%!in%" <- function(x,y)!('%in%'(x,y))
+
+#List files in a specific directory, and get date with an expected date format
+
+File_Lister <- function(path,namePattern,extension,dateFormat){
+  list.files(path)%>%
+    #Convert the list to a data frame with a reasonable, single column name
+    data.frame() %>%
+    `colnames<-`(c("filename")) %>%
+    
+    #Remove very old files which don't have the expected naming convention
+    filter(str_detect(string=filename,
+                      pattern=namePattern)) %>%
+    
+    #Parse the filename to figure out the date
+    #First remove the first part of the filename
+    mutate(date = str_remove(string = filename,
+                             pattern = namePattern)) %>%
+    #Then remove the extension
+    mutate(date = str_remove(string = date,
+                             pattern = extension)) %>%
+    #Then turn the character into a date
+    mutate(date = dateFormat(date)) %>%
+    
+    #Create the file_path for use later
+    mutate(filepath = paste0(path,filename)) %>%
+    
+    #Get the file size
+    mutate(filesize = file.info(filepath)$size)
+}
+
+```
+
+## Introduction
+
+This document contains a report of how recently hospitals have reported to COPHS.
+
+This report is generated automatically using a script written in R.
+
+For issues, please contact Brian Erly, <brian.erly@state.co.us>.
+
+This script requires access to the folder "K:/CEDRS/Hosp_Uploads/2 Be Processed".
+The first block of code evaluates whether that folder is accessible. 
+If it is not accessible, you may need to log into the VPN.
+
+```{r load data, include=FALSE}
+# Identify the processed COPHS files you want from the K drive ------------------------
+#Check if K drive is accessible, throws an error if not
+if (file.exists("K:/CEDRS/Hosp_Uploads/2 Be Processed")) {
+  glue("The K drive is accessible, ready to run the rest of the script.")
+} else {
+  errorCondition("The K drive is not accessible, or you do not have permissions
+                 for the Hosp_Upload folder.")
+}
+```
+
+## Loading data
+
+Data is loaded from the most recent data file output by COPHS.
+
+COPHS data is typically output once a day around mid-morning.
+
+
+```{r Get COPHS Data, warning = FALSE, message = TRUE, echo=FALSE}
+
+#Get information for the most recent COPHS file in the K drive.
+newestFile <- File_Lister(path = "K:/CEDRS/Hosp_Uploads/2 Be Processed/",
+            namePattern = "EXPANDED_FORMAT_COVID_Patient_Data_All_Hosp_",
+            extension = ".csv",
+            dateFormat  = ymd) %>%
+  #Choose only the newest file
+  filter(date == max(date,na.rm=TRUE))
+
+#Get the filename from that file
+
+newestFilepath <- newestFile$filepath
+
+#Import that data
+
+newestCOPHSData <- read_csv(file = newestFilepath,
+                            show_col_types = FALSE) %>%
+  select(-"...1") %>%
+  suppressMessages()
+
+if (nrow(newestCOPHSData)>60000) {
+  glue("
+  COPHS data import complete.
+  
+  COPHS data current as of {newestFile$date}.
+  
+  {nrow(newestCOPHSData)} records imported from {newestCOPHSData %>%
+  select(`Facility Name`) %>%
+  unique() %>%
+  nrow()} facilities.
+       ") #/glue
+} else {
+  glue("
+       Something looks wrong with the COPHS records.
+       
+       There are fewer records than expected.
+       ")
+} #if/else
+
+```
+
+```{r Get REDCap Data, warning = FALSE, message = FALSE, echo=FALSE}
+
+#Now we get the information from REDCap
+##This gives the informaton to connect to CDPHE's redcap using Brian's API
+rcon <- redcapConnection(url = "https://cdphe.redcap.state.co.us/api/",
+                         #Everyone should have thier own API token, ideally
+                         token = "C5D6F1FE3F9EB01E2CEF3211F887BF36")
+
+#And this gets the data about each uploaded file
+RCrecords <- exportRecords(rcon = rcon)
+
+#This reformatst stuff a little bit to make it more readable
+RCrecords <- RCrecords %>%
+  #Transmute does both mutate and deletes other fields. It's nifty.
+  transmute(record_id = as.character(record_id),
+           date_uploaded = pmax(ymd_hms(date_uploaded),
+                               ymd_hms(covid_patient_hospitalization_document_upload_timestamp),
+                               na.rm = TRUE),
+           poc_name = as.character(poc_name),
+           poc_phone = as.character(poc_phone),
+           poc_email = as.character(poc_email),
+           RC_facility_name = as.character(facility_name)
+  )
+
+#Output some text letting folks know it went well
+if (nrow(RCrecords)>9000) {
+  glue("
+  REDCap data import complete.
+  
+  Last REDcap file uploaded {max(RCrecords$date_uploaded,na.rm=TRUE)}.
+  
+  {nrow(RCrecords)} records imported.
+       ") #/glue
+} #/if
+
+```
+
+## Evaluate upload recency
+
+For each facility, we generate data about the last time they uploaded a file
+as well as the last time they reported a new admission.
+
+```{r Parse reporting frequency, echo=FALSE}
+#Look at the last time each facility sent in data
+
+#Match patient data to an upload, and find the last upload for each hospital
+lastUploadByHospital <- newestCOPHSData %>%
+  #REmoves everything after the "--" in filename using a regular expression
+  mutate(record_id = gsub("\\--.*","",filename)) %>%
+  
+ #Joins in the data we downloaded from REDCap abiove
+  left_join(RCrecords,by="record_id") %>%
+  
+  #Performs a groupwise summarizing operation, similar to above
+  group_by(`Facility Name`) %>%
+  
+  summarize(LastUploadDate = max(date_uploaded),
+            LastUploadFile = max(as.numeric(record_id))) %>%
+  
+  #Removes missing data
+  filter(!is.na(LastUploadDate))
+
+# Find most recent admission by hospital 
+lastAdmissionByHospital <- newestCOPHSData %>%
+  
+  #Convert admission dates into dates
+  mutate(AdmitDate = parse_date_time(`Hospital Admission Date  (MM/DD/YYYY)`,
+                                     orders = c("ymd","mdy"))) %>%
+  
+  #Perform the operation for each facility (and not all at once)
+  group_by(`Facility Name`) %>%
+  
+  #Find the last day someone was admitted
+  summarize(LastAdmitDate = max(AdmitDate)) %>%
+  
+  #Remove invalid dates
+  filter(!is.na(LastAdmitDate))
+
+# Get the total number of patients reported by hospital, just for some context
+patientsByHospital <- newestCOPHSData %>%
+  group_by(`Facility Name`) %>%
+  summarize(reported_patients = n())
+
+#Combine that data into one big table
+hospitalReportingTimeliness <- lastUploadByHospital %>%
+  left_join(lastAdmissionByHospital, 
+              by="Facility Name") %>%
+  left_join(patientsByHospital, 
+              by="Facility Name") %>%
+  #Arrange it so the biggest hospitals are first
+  arrange(desc(reported_patients))
+
+#Output some text
+glue(
+  "
+  Timeliness data generated for {nrow(lastUploadByHospital)} distinct facility names.
+  "
+)
+
+```
+
+The below table summarize hospitals with timely or delayed reporting.
+
+Adequate reporting will provide data on hospitalized patients within 7 days. 
+
+For hospitals with on average 3 or more admissions per week, reporting 5 days a week is required.
+
+For hospitals with on average 2 or fewer admissions per week, reporting 2 days a week is adequate.
+
+```{r Reporting Status, echo=FALSE}
+
+# This calculates the small vs large hospital
+# cutoff in total patient records, assuming hospitalizations started 
+# on 4/1/2020
+
+#First calculate the interval in days
+reportingDays <- difftime(Sys.Date(),
+                            ymd("2020-4-1"),
+                           units="days") %>%
+  as.numeric("days")
+
+#Then calculate a cutoff of the number of admissions
+largeSmallCutoff <- (floor((reportingDays / 7)
+                     * 3)
+)
+
+#Generate data for the alert table
+alertTableData <- hospitalReportingTimeliness %>%
+  
+  #Classify hospitals as large or small
+  mutate(largeFacility = {reported_patients>largeSmallCutoff}) %>%
+  
+  #Calculate the days since last report
+  transmute(
+    `Facility Name` = `Facility Name`,
+    
+    uploadDelay = difftime(Sys.Date(),
+                            LastUploadDate,
+                           units="days") %>%
+      round(),
+    
+    admitDelay = difftime(Sys.Date(),
+                            LastAdmitDate,
+                           units="days"),
+    
+    largeFacility = largeFacility
+    
+  ) %>%
+  
+  mutate(Status = case_when(
+    largeFacility = TRUE & uploadDelay <= 4 ~ 1,
+    
+    largeFacility = FALSE & uploadDelay <= 10 ~ 1,
+    
+    TRUE ~ 0
+
+  ))
+
+#Output the table
+
+alertTableData %>%
+  #Choose only the hospitals with problems
+  filter(Status == 0) %>%
+  
+  #Name and arrange the columns
+  transmute(
+    Facility = `Facility Name`,
+    `Large_Facility?` = largeFacility,
+    `Days_Since_Last_Upload` = uploadDelay,
+    `Days_Since_Last_Admission` = admitDelay
+  ) %>%
+  
+  #Make it into a table
+  kbl(caption = "Hospitals with No Recent Uploads") %>%
+  kable_material(full_width = F)%>%
+  footnote(general = 
+             ("Name variants have not been deduplicated at this time."))
+
+
+```
+
+## Directory
+
+The below table lists the most recent contact information provided through REDCap
+for each facility.
+
+```{r Directory, echo=FALSE, warning=FALSE}
+
+#Choose the most recent record for each hospital and create a table of contact info
+directoryTableData <- RCrecords %>%
+  mutate(record_id = as.numeric(record_id)) %>%
+  
+  #Join in with the most recent file for each facility
+  right_join(lastUploadByHospital,by=c("record_id" = "LastUploadFile"))
+
+directoryTableData %>%
+  transmute(
+    Facility = `Facility Name`,
+    Name = poc_name,
+    Phone = poc_phone,
+    Email = poc_email
+  ) %>%
+  kbl(caption = "Contact Information by Facility") %>%
+  kable_material(full_width = F) %>%
+  footnote(general = 
+             ("More complete contact information may be available on REDCap server
+             or Google Drive POC list."))
+
+```
