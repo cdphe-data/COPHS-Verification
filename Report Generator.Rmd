@@ -28,6 +28,10 @@ library(redcapAPI)
 #Make nice tables
 library(kableExtra)
 
+# Load API key.
+source("secrets.R")
+
+
 #Brian-Defined Functions
 
 #Check if something is not found in a list
@@ -137,12 +141,11 @@ if (nrow(newestCOPHSData)>60000) {
 ```
 
 ```{r Get REDCap Data, warning = FALSE, message = FALSE, echo=FALSE}
-
 #Now we get the information from REDCap
 ##This gives the informaton to connect to CDPHE's redcap using Brian's API
 rcon <- redcapConnection(url = "https://cdphe.redcap.state.co.us/api/",
                          #Everyone should have thier own API token, ideally
-                         token = "C5D6F1FE3F9EB01E2CEF3211F887BF36")
+                         token = API_key)
 
 #And this gets the data about each uploaded file
 RCrecords <- exportRecords(rcon = rcon)
