@@ -3,6 +3,7 @@ title: "COPHS Verification Report"
 author: "Brian Erly - CDPHE"
 date: "`r lubridate::today()`"
 output:
+  pdf_document: default
   html_document: default
 ---
 
